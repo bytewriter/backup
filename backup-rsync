@@ -1,0 +1,166 @@
+#!/bin/bash
+# This file: /backup/bin/backup-rsync
+# Perform the rsyncs and validation (if configured)
+# mel - Feb 2011
+# mel - Apr 2013 - added timeouts
+# mel - Jun 2013 - added fallback to uncompressed rsync after finding that compressed occasionally fails
+# mel - Jul 17 2013 - new ext4 has real values in the nanoseconds of timestamp, rsync'd files do not get nanoseconds (yet?), which causes failures in diff
+# mel - Jul 30 2013 - ls now show a '.' or '+' for security that breaks compares. removed it.
+# mel - 2014-05-15 - servers on local lan can actually finish too quickly, added sleep and delete start if exists
+
+# figure out where we are to find configs and bins
+pushd $(dirname $0) >/dev/null
+if [ -f backup-conf ];then
+    . backup-conf
+else
+    echo "No backup-conf in $(pwd)"
+    exit
+fi
+if [ -f backup-functions ];then
+    . backup-functions
+else
+    echo "Missing $(pwd)/backup-functions"
+    exit
+fi
+popd >/dev/null
+
+SERVER=$1
+getserverargs $1
+
+echo "$(hostname):$$" >$IPC/$SERVER.rsync.run
+logentry $Debug "Starting $(basename $0): for rsync of host: $SERVER"
+echo "backing up: $SERVER"
+
+[ -d $LATEST/$SERVER ] || mkdir -p $LATEST/$SERVER
+
+for rsyncdir in $(rsync --timeout=300 $SERVER$RSYNCsep|awk '{print $1}');do
+    logentry $Debug "Starting rsync of $SERVER$RSYNCsep$rsyncdir"
+    rsync -aqz $DELarg --numeric-ids --safe-links --timeout=300 $SERVER$RSYNCsep$rsyncdir $LATEST/$SERVER/$rsyncdir 2>${IPC}/${SERVER}.rsync.errors
+    rsyncout="$?"
+    # compressed can fail in certain remote vs local situations, try uncompressed before giving up
+    if [ "$rsyncout" != "0" ];then
+        logentry $Warning "Compressed rsync of $SERVER$RSYNCsep$rsyncdir failed. Attempting uncompressed"
+        rsync -aq $DELarg --numeric-ids --safe-links --timeout=300 $SERVER$RSYNCsep$rsyncdir $LATEST/$SERVER/$rsyncdir 2>>${IPC}/${SERVER}.rsync.errors
+        rsyncout="$?"
+    fi
+    if [ "$rsyncout" != "0" ];then
+        logentry $Error "Error occured while rsyncing $SERVER$RSYNCsep$rsyncdir"
+        logentryfile $Error ${IPC}/${SERVER}.rsync.errors
+        /bin/rm -f $IPC/$SERVER.rsync.run
+        exit
+    fi
+    [ -f ${IPC}/${SERVER}.rsync.errors -a ! -s ${IPC}/${SERVER}.rsync.errors ] && /bin/rm -f ${IPC}/${SERVER}.rsync.errors
+done
+
+# if the start file is still there, perhaps we finished too quickly
+[ -f ${IPC}/${SERVER}.rsync.start ] && sleep 10
+# if it's still there, delete it cause something is wrong
+[ -f ${IPC}/${SERVER}.rsync.start ] && /bin/rm -f ${IPC}/${SERVER}.rsync.start
+
+# validate files
+if [ "$BKUPTYPE" == "f" -a "$DELFLAG" != "n" -a "$VALIDATION" !=  "" ];then
+    logentry $Debug "Starting rsync of $SERVER$RSYNCsep$VALIDATION for validation"
+    rsync -aqz --delete --timeout=300 $SERVER$RSYNCsep$VALIDATION $FLAGS/$SERVER 2>${IPC}/${SERVER}.rsync.errors
+    if [ "$?" != "0" ];then
+        logentry $Error "Error occured while rsyncing $SERVER$RSYNCsep$VALIDATION"
+        logentryfile $Error ${IPC}/${SERVER}.rsync.errors
+        /bin/rm -f $IPC/$SERVER.rsync.run
+        exit
+    fi
+    [ -f ${IPC}/${SERVER}.rsync.errors -a ! -s ${IPC}/${SERVER}.rsync.errors ] && /bin/rm -f ${IPC}/${SERVER}.rsync.errors
+
+    [ -f $FLAGS/$SERVER/a.tmp ] && /bin/rm -f $FLAGS/$SERVER/a.tmp
+    logentry $Debug "getting list of files here for $SERVER for validation"
+    pushd $LATEST/$SERVER >/dev/null
+    for rsyncmodname in `ls`;do
+        pushd $rsyncmodname >/dev/null
+        for dirhere in `ls`;do
+            if [ "$SKIPVALID" != "" ];then
+                if echo $SKIPVALID|grep $dirhere >/dev/null;then
+                    continue
+                fi
+            fi
+            pushd $dirhere >/dev/null
+            # sed below removes the fractions of seconds and the '.' or '+' security flag until all systems suport them
+            ls -lnAR --full-time|sed 's/ \([0-2][0-9]:[0-5][0-9]:[0-5][0-9]\).[0-9][0-9]* / \1 /;s/^\(..........\)[^ ]* /\1 /'|egrep -v '(^\.|^total|^$|^l)' >>$FLAGS/$SERVER/a.tmp
+            popd >/dev/null
+         done
+         popd >/dev/null
+     done
+     popd >/dev/null
+
+    if [ "$SKIPUSERS" != "" ];then
+        logentry $Trace "Found SKIPUSERS: \"$SKIPUSERS\" during validation"
+        for uidgid in $(echo $SKIPUSERS|sed 's/:/ /g');do
+            if echo $uidgid|grep '[a-z]' >/dev/null;then
+                logentry $Trace "Found $uidgid as a username in SKIPUSERS"
+                if [ ! -f $LATEST/$SERVER/etc/passwd -a ! -f $LATEST/$SERVER/*/etc/passwd ];then
+                    logentry $Error "Username: $uidgid in SKIPUSERS for $SERVER without etc/passwd in the rsync"
+                    /bin/rm -f $IPC/$SERVER.rsync.run
+                    exit
+                else
+                    if [ -f $LATEST/$SERVER/etc/passwd ] && grep ^${uidgid}: $LATEST/$SERVER/etc/passwd >/dev/null;then
+                        [ "$ignorelist" == "" ] || ignorelist="${ignorelist}|"
+                        ignorelist="${ignorelist}$(grep ^${uidgid}: $LATEST/$SERVER/etc/passwd|awk -F: '{printf(" %s *%s ",$3,$4)}')"
+                    elif [ -f $LATEST/$SERVER/*/etc/passwd ] && grep ^${uidgid}: $LATEST/$SERVER/*/etc/passwd >/dev/null;then
+                        [ "$ignorelist" == "" ] || ignorelist="${ignorelist}|"
+                        ignorelist="${ignorelist}$(grep ^${uidgid}: $LATEST/$SERVER/*/etc/passwd|awk -F: '{printf(" %s *%s ",$3,$4)}')"
+                    else
+                        logentry $Warning "Username: $uidgid in SKIPUSERS for $SERVER does not exist in etc/passwd"
+                    fi
+                fi
+            elif echo $uidgid|egrep '^[0-9][0-9]*:[0-9][0-9*$' >/dev/null;then
+                [ "$ignorelist" == "" ] || ignorelist="${ignorelist}|"
+                ignorelist="${ignorelist}$(echo $uidgid|awk -F. '{printf(" %s *%s ",$1,$2)}')"
+            else
+                logentry $Warning "Ignoring garbage: \"$uidgid\" in SKIPUSERS for $SERVER"
+            fi
+        done
+        if echo $ignorelist|grep '|' >/dev/null;then
+            ignorelist="(${ignorelist})"
+        fi
+        logentry $Debug "SKIPUSERS evaluated to: \"$ignorelist\" for validation of $SERVER"
+        egrep -v "$ignorelist" $FLAGS/$SERVER/a.tmp |awk '/^d/{print $1 " " $6 " " $7 " " $9;next} {print $1 " " $5 " " $6 " " $7 " " $9}'|sort >$FLAGS/$SERVER/all.vault
+    else
+        awk '/^d/{print $1 " " $6 " " $7 " " $9;next} {print $1 " " $5 " " $6 " " $7 " " $9}' $FLAGS/$SERVER/a.tmp|sort >$FLAGS/$SERVER/all.vault
+    fi
+
+    # if previous validation errors exist, remove them
+    [ -f $IPC/$SERVER.validationerrors ] && /bin/rm -f $IPC/$SERVER.validationerrors
+    # sed below removes the '.' or '+' security flag until all systems support it
+    awk '/^d/{print $1 " " $4 " " $5 " " $7;next} {print $1 " " $4 " " $5 " " $6 " " $8}' $FLAGS/$SERVER/*.orig |sed 's/^\(..........\)[^ ]* /\1 /'|sort >$FLAGS/$SERVER/all.orig
+
+    let mydiff="$(diff -y --suppress-common-lines $FLAGS/$SERVER/all.orig $FLAGS/$SERVER/all.vault|wc -l)"
+    if [ "$mydiff" != "0" ];then
+        diff $FLAGS/$SERVER/all.orig $FLAGS/$SERVER/all.vault >$IPC/$SERVER.validationerrors
+        /bin/cp -f $IPC/$SERVER.validationerrors $IPC/$SERVER.validationerrors.tmp
+        logentry $Error "Validation failed: < $SERVER files > $(hostname) files"
+        logentryfile $Error $IPC/$SERVER.validationerrors.tmp
+        if [ ! -f $IPC/$SERVER.validation.emailed -o "$(date -r $IPC/$SERVER.validation.emailed +%x)" != "$(date +%x)" ];then
+            echo "$VFAILMAIL" >$IPC/$SERVER.validation.emailed
+            cat << MEL |mail -s "$(hostname) $SERVER differences found!" $VFAILMAIL
+Differences found while validating backup of $SERVER were:
+
+< $SERVER files
+> $(hostname) files
+$(diff $FLAGS/$SERVER/all.orig $FLAGS/$SERVER/all.vault)
+MEL
+            /bin/rm -f $IPC/$SERVER.rsync.run
+            exit
+        fi
+    else
+        [ -f $IPC/$SERVER.validation.emailed ] && /bin/rm -f $IPC/$SERVER.validation.emailed
+        logentry $Info "Files for $SERVER successfully validated"
+    fi
+else
+    logentry $Trace "No validation for $SERVER: BKUPTYPE=$BKUPTYPE DELFLAG=$DELFLAG VALIDATION=$VALIDATION"
+fi
+
+# rsync complete... update daily flag
+[ "$BKUPTYPE" == "f" ] && /bin/cp -pf $FLAGS/$SERVER/$TYPEARGfile $LASTFLAGS/$SERVER/
+
+logentry $Info "rsync on $SERVER started: $(date -r $IPC/$SERVER.rsync.run)  finished: $(date)"
+echo "Copy started: $(date -r $IPC/$SERVER.rsync.run '+%b %e %T')" >$IPC/$SERVER.rsync.done
+echo "Copy finished: $(date '+%b %e %T')" >>$IPC/$SERVER.rsync.done
+rm -f $IPC/$SERVER.rsync.run
+logentry $Debug "Exiting $(basename $0)"

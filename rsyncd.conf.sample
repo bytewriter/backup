@@ -1,0 +1,13 @@
+# /etc/rsyncd: configuration file for rsync daemon mode
+[etc]
+	path = /etc
+        comment = etc
+        uid = root
+        gid = root
+        hosts allow=10.255.225.219, 10.255.225.80/24
+[varnamed]
+        path = /var/named
+        comment = /var/named
+        uid = root
+        gid = root
+        hosts allow=10.255.225.219, 10.255.225.80/24

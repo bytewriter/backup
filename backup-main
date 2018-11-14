@@ -1,0 +1,295 @@
+#!/bin/bash
+# This file: /backup/bin/backup-main
+# Main backup, starts the backups, tars
+# mel - 2011-01 Started scripts
+# mel - 2013-04 Added timeouts to rsync
+# mel - 2014-04-17 added MAXWAIT var, and adjusted sleep down a bit
+# mel - 2014-04-18 added check for errors when calling backup-rsync
+# mel - 2014-05-15 cleaned up PID file check routines a bit
+# mel - 2014-05-19 languages
+
+# stop multibyte from screwing up our world
+export LANG=C LC_ALL=C
+
+# figure out where we are to find configs and bins
+pushd $(dirname $0) >/dev/null
+if [ -f backup-conf ];then
+    . backup-conf
+else
+    echo "No backup-conf in $(pwd)"
+    exit
+fi
+if [ -f backup-functions ];then
+    . backup-functions
+else
+    echo "Missing $(pwd)/backup-functions"
+    exit
+fi
+popd >/dev/null
+logentry 2 "Starting $(basename $0)"
+
+# Validate global options
+[ "$IPC" == "" ] && configerror IPC
+[ -d "$IPC" ] || mkdir "$IPC"
+[ "$DAILY" == "" ] && configerror DAILY
+[ -d "$DAILY" ] || mkdir "$DAILY"
+[ "$EOM" == "" ] && configerror EOM
+[ -d "$EOM" ] || mkdir "$EOM"
+[ "$LOGS" == "" ] && configerror LOGS
+[ -d "$LOGS" ] || mkdir "$LOGS"
+[ "$WEB" == "" ] && configerror WEB
+[ -d "$WEB" ] || mkdir "$WEB"
+[ "$FLAGS" == "" ] && configerror FLAGS
+[ -d "$FLAGS" ] || mkdir "$FLAGS"
+[ "$LASTFLAGS" == "" ] && configerror LASTFLAGS
+[ -d "$LASTFLAGS" ] || mkdir "$LASTFLAGS"
+[ "$MAXRSYNCS" == "" ] && configerror MAXRSYNCS
+[ "$MAXTARS" == "" ] && configerror MAXTARS
+
+# cannot continue without config file
+if [ ! -f $CONF/backup.conf ];then
+    logentry 6 "$LANGMISSING $CONF/backup.conf"
+    exit
+fi
+
+# a stale file could have been created by this script on this
+# server. possible conflict with ourselves due to crash or
+# killing this script or the latency of SAN/NAS. I need to check
+# if the pid is still running, if not delete the file
+# args are: 1=rel/path/to/ipc/file 2=type (rysnc, tar)
+# funkout set to "Y" if process is valid, "N" if not
+check_stale_pid(){
+    # is this server the one that created the file?
+    if grep "^$(hostname):" $1 >/dev/null;then
+        statdata="$(grep "^$(hostname):" $1)"
+        prevpid="${statdata#*:}"
+        if [ -z "$prevpid" ];then
+            # what? no pid? file must be corrupted - delete it
+            sleep 3  # just in case, give another server time to get over it
+            logentry 2 "$LANGDELEINGCORRUPT $1 ($LANGCREATED: $(date -r $1))"
+            /bin/rm -f $1
+            funkout="N"
+            return
+        else
+            # check if pid still exists - errors count as no
+            if ps p $prevpid >/dev/null;then
+                logentry 1 "$LANGFOUND $2 $LANGPROCESSFOR $SERVER $LANGRUNNINGSINCE: $(date -r $1)"
+                funkout="Y"
+                return
+            else
+                # probably don't really need to sleep here, but time solves all problems
+                sleep 2
+                logentry 2 "pid $prevpid ($LANGSTARTED $(date -r $1)), $LANGDOESNOTEXIST - $LANGDELETING $1"
+                /bin/rm -f $1
+                funkout="N"
+                return
+            fi
+        fi
+    else
+        # not seen yet, but still possible: start file is corrupted such that hostname is not readable
+        # need to add that check here
+        logentry 2 "$LANGFOUND $2 $LANGFOR $SERVER $LANGSTARTEDONSERVER: $(date -r $1)"
+        funkout="Y"
+        return
+    fi
+}
+
+myhost="$(hostname)"
+
+logentry 2 "$LANGSTARTING rsync $LANGLOOPFORALL"
+# check servers that need to be synced
+for SERVER in $(egrep '^[a-z0-9]' ${CONF}/backup.conf|sed 's/,.*$//');do
+    logentry 1 "$LANGCHECKINGIFSERVER $SERVER $LANGNEEDSTOBE rsyncd"
+    # first, is it already running? check will be faster than rsyncing flags
+    if [ -f ${IPC}/${SERVER}.rsync.run ];then
+        # It appears the backup of this server is already running
+        # check for stale run file -
+        check_stale_pid ${IPC}/${SERVER}.rsync.run rsync
+        [ "$funkout" == "Y" ] && continue
+        # a "N" exit means we can start this one just fall through to the rest of the script
+    fi
+    # if done file exists, rsync has happened already
+    if [ -f ${IPC}/${SERVER}.rsync.done ];then
+        logentry 1 "rsync $LANDPROCESSALREADYDONE $SERVER"
+        continue
+    fi
+    # check for start file
+    if [ -f ${IPC}/${SERVER}.rsync.start ];then
+        # check for stale start file -
+        check_stale_pid ${IPC}/${SERVER}.rsync.start rsync
+        [ "$funkout" == "Y" ] && continue
+    fi
+    # How many rsync processes are already running on this host
+    rsynccount="$(grep "^${myhost}:" ${IPC}/*.rsync.run 2>/dev/null|wc -l)"
+    if [ $rsynccount -ge $MAXRSYNCS ];then
+        logentry 2 "$LANGTHEREARE $rsynccount rsync $LANGPROCESSESALREADY ( >= $MAXRSYNCS)"
+        continue
+    fi
+    # "register" with IPC: we are going to try to back up this server
+    [ -f ${IPC}/${SERVER}.rsync.start ] || echo -n "$(hostname):$$" >${IPC}/${SERVER}.rsync.start
+    sync
+    sleep 2
+    # did another server overwrite our file? 
+    if [ "$(hostname):$$" != "$(cat ${IPC}/${SERVER}.rsync.start)" ];then
+        # yes, another server is working on backing up this server
+        logentry 2 "$LANGANOTHERISALREADY rsync $LANGFOR $SERVER"
+        continue
+    fi
+
+    # check if this server needs to be backed up
+    getserverargs $SERVER
+    backupneeded="n"
+    case "$BKUPTYPE" in
+        f)
+            # for type f, differences between file and last file indicates a backup needed
+            [ -d $LASTFLAGS/$SERVER ] || mkdir $LASTFLAGS/$SERVER
+            [ -f $LASTFLAGS/$SERVER/$TYPEARGfile ] || touch $LASTFLAGS/$SERVER/$TYPEARGfile
+            [ -d $FLAGS/$SERVER ] || mkdir $FLAGS/$SERVER
+            logentry 2 "rsync $LANGFLAGFILE: $SERVER$RSYNCsep$TYPEARG"
+            rsync -aqz --delete --timeout=300 $SERVER$RSYNCsep$TYPEARG $FLAGS/$SERVER 2>${IPC}/${SERVER}.rsync.errors
+            if [ $? -ne 0 ];then
+                logentry 5 "$LANGERRORWHILE $LANGRSYNCINGFLAG: $SERVER$RSYNCsep$TYPEARG $LANGWAS:"
+                logentryfile 5 ${IPC}/${SERVER}.rsync.errors
+                /bin/rm -f ${IPC}/${SERVER}.rsync.start
+                continue
+            fi
+            [ -f ${IPC}/${SERVER}.rsync.errors -a ! -s ${IPC}/${SERVER}.rsync.errors ] && /bin/rm -f ${IPC}/${SERVER}.rsync.errors
+            # backup flag changed from last time?
+            if ! diff -q $FLAGS/$SERVER/$TYPEARGfile $LASTFLAGS/$SERVER/$TYPEARGfile >/dev/null;then
+                logentry 1 "$LANGWILL rsync $SERVER $LANGBECAUSEDIFFFOUND $TYPEARGfile"
+                backupneeded="y"
+            else
+                logentry 1 "$LANGNODIFFFOUND $TYPEARGfile $LANGFOR $SERVER"
+            fi
+            ;;
+        s)
+            ;;
+        d)
+            # type d, if the last tar file is not dated today, and they want backups today: backup
+            backupwanted="n"
+            today="$(date +%u)"
+            todayx="$(date +%w)"
+            if echo $TYPEARG|grep $today >/dev/null;then
+                backupwanted="y"
+            fi
+            if echo $TYPEARG|grep $todayx >/dev/null;then
+                backupwanted="y"
+            fi
+            # if backup is configured for today, have we already done one?
+            if [ "$backupwanted" == "y" ];then
+                # have we ever done a backup of this server?
+                if [ "$(ls $DAILY/$SERVER.* 2>/dev/null|wc -l)" -gt 0 ];then
+                    lastbackup="$(ls -tr $DAILY/$SERVER.*|tail -1)"
+                    dateoflastbackup="$(date -r $lastbackup +%D)"
+                    datetoday="$(date +%D)"
+                    if [ "$datetoday" != "$dateoflastbackup" ];then
+                        logentry 1 "$LANGFOR $SERVER: $LANGTODAYNOTSAMEAS"
+                        backupneeded="y"
+                    else
+                        logentry 1 "$LANGFOR $SERVER: $LANGDATEMATCHES - $LANGWILLNOT rsync"
+                    fi
+                else
+                    # we have never backed up this server
+                    logentry 1 "$LANGWILL rsync $SERVER $LANGBECAUSENEVER"
+                    backupneeded="y"
+                fi
+            fi
+            ;;
+        *)
+            logentry 5 "$LANGINVALID BKUPTYPE \"$BKUPTYPE\" $LANGFOR $SERVER $LANGIN $CONF/backup.conf"
+            /bin/rm -f ${IPC}/${SERVER}.rsync.start
+            continue
+            ;;
+    esac
+    if [ "$backupneeded" == "n" ];then
+        logentry 1 "$LANGDETERMINEDTHAT $SERVER $LANGDOESNOTNEED rsync"
+        /bin/rm -f ${IPC}/${SERVER}.rsync.start
+        continue
+    fi
+    logentry 2 "$LANGCALLING backup-rsync $LANGFOR $SERVER" 
+    screen -d -m $BACKUPBASE/bin/backup-rsync $SERVER >/tmp/rsync.start.$(hostname).$$ 2>&1
+    starterror="$?"
+    if [ "$starterror" -ne 0 ];then
+        logentry 5 "rsync $LANGFAILEDTOSTART. $LANGERRORWAS:"
+        logentryfile 5 /tmp/rsync.start.$(hostname).$$
+        [ -s /tmp/rsync.start.$(hostname).$$ ] && /bin/rm -f /tmp/rsync.start.$(hostname).$$
+    else
+        # wait for run file to appear
+        let timestart="$(date +%s)"
+        while [ ! -f $IPC/$SERVER.rsync.run ];do
+            timer=$(($(date +%s)-$timestart))
+            if [ $timer -lt $MAXWAIT ];then
+                sleep .5
+            else
+                logentry 5 "$LANGRSYNCFAILEDSTART. $LANGNO2 $IPC/$SERVER.rsync.run $LANGFILECREATEDAFTER $MAXWAIT $LANGSECS."
+                break
+            fi
+        done
+    fi
+    /bin/rm -f ${IPC}/${SERVER}.rsync.start
+done
+
+logentry 2 "$LANGSTARTING tar $LANGLOOPFORALL"
+## check for backups that now need to be compressed and saved
+for SERVER in $(egrep '^[a-z0-9]' ${CONF}/backup.conf|sed 's/,.*$//');do
+    logentry 1 "$LANGCHECKINGIFDATA $SERVER $LANGISREADYFOR tar"
+    # if rsync done file does not exist, rsync has not happened
+    if [ ! -f ${IPC}/${SERVER}.rsync.done ];then
+        logentry 1 "$LANGDATAFOR $SERVER $LANGISNOTWAITING tar"
+        continue
+    fi
+
+    # is tar for this server already running?
+    if [ -f ${IPC}/${SERVER}.tar.run ];then
+        # check for stale processes
+        check_stale_pid ${IPC}/${SERVER}.tar.run tar
+        [ "$funkout" == "Y" ] && continue
+    fi
+
+    # check for start file
+    if [ -f ${IPC}/${SERVER}.tar.start ];then
+        # check for stale start file here (if we created it, wtf--crash? 2 copies of main running at the same time?)
+        check_stale_pid ${IPC}/${SERVER}.tar.start tar
+        [ "$funkout" == "Y" ] && continue
+    fi
+    # How many tar processes are already running on this host?
+    tarcount="$(grep "${myhost}:" ${IPC}/*.tar.run 2>/dev/null|wc -l)"
+    if [ $tarcount -ge $MAXTARS ];then
+        logentry 1 "$LANGTHEREARE $tarcount tar $LANGPROCESSESALREADY ( >= $MAXTARS)"
+        continue
+    fi
+    # "register" with IPC: we are going to tar this server backup
+    [ -f ${IPC}/${SERVER}.tar.start ] || echo -n "$(hostname):$$" >${IPC}/${SERVER}.tar.start
+    sleep 2
+    # did another process overwrite our file?
+    if [ "$(hostname):$$" != "$(cat ${IPC}/${SERVER}.tar.start)" ];then
+        # yes, another server is working on the tar for this server
+        logentry 1 "$LANGANOTHERISALREADY tar $LANGFOR $SERVER"
+        continue
+    fi
+
+    logentry 2 "$LANGCALLING backup-tar $LANGFOR $SERVER"
+    screen -d -m $BACKUPBASE/bin/backup-tar $SERVER >/tmp/tar.start.$(hostname).$$
+    starterror="$?"
+    if [ "$starterror" -ne 0 ];then
+        logentry 5 "tar $LANGFAILEDTOSTART. $LANGERRORWAS:"
+        logentryfile 5 /tmp/tar.start.$(hostname).$$
+        [ -s /tmp/tar.start.$(hostname).$$ ] && /bin/rm -f /tmp/tar.start.$(hostname).$$
+    else
+        # wait for tar.run file to appear
+        let timestart="$(date +%s)"
+        while [ ! -f $IPC/$SERVER.tar.run ];do
+            timer=$(($(date +%s)-$timestart))
+            if [ $timer -lt $MAXWAIT ];then
+                sleep .5
+            else
+                logentry 5 "tar $LANGFAILEDTOSTART. $LANGNO2 $IPC/$SERVER.tar.run $LANGFILECREATEDAFTER $MAXWAIT $LANGSECONDS."
+                break
+            fi
+            let timer=$timer+1
+        done
+    fi
+    /bin/rm -f ${IPC}/${SERVER}.tar.start
+done
+
+logentry 2 "$LANGEXITING $(basename $0)"

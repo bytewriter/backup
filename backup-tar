@@ -1,0 +1,145 @@
+#!/bin/bash
+# This file: /backup/bin/backup-tar
+# This script performs the tar compression of the server data
+# and the EOM copy
+# mel - Mar 2011
+# mel - July 2013 - minor rsync fix to timeout
+
+# figure out where we are to find configs and bins
+pushd $(dirname $0) >/dev/null
+if [ -f backup-conf ];then
+    . backup-conf
+else
+    echo "No backup-conf in $(pwd)"
+    exit
+fi
+if [ -f backup-functions ];then
+    . backup-functions
+else
+    echo "Missing $(pwd)/backup-functions"
+    exit
+fi
+popd >/dev/null
+
+uglyexit(){
+    logentry 5 "Ugly exit"
+    /bin/rm -f ${IPC}/${SERVER}.tar.*
+    exit
+}
+
+SERVER=$1
+getserverargs $SERVER
+
+echo "$(hostname):$$" >$IPC/$SERVER.tar.run
+
+[ -d $DAILY ] || mkdir -p $DAILY
+
+pushd $LATEST >/dev/null
+
+logentry 2 "Starting $(basename $0): for tar of host: $SERVER"
+echo "Starting tar of: $SERVER"
+tar $TARARGS ${DAILY}/${SERVER}.0.${TAREXT} $SERVER 2>${IPC}/${SERVER}.tar.errors
+if [ "$?" != "0" ];then
+    logentry 5 "Error occured while attempting tar of $SERVER"
+    logentryfile 5 ${IPC}/${SERVER}.tar.errors
+    /bin/rm -f $IPC/$SERVER.tar.run
+    exit
+fi
+
+# rotate after successful tar
+logentry 2 "Deleting oldest backup in rotation for $SERVER"
+[ -f $DAILY/${SERVER}.${ROTATION}.$TAREXT ] && /bin/rm -f $DAILY/${SERVER}.${ROTATION}.$TAREXT
+
+logentry 2 "Rotating remaining backups for $SERVER"
+# no test needed, since seq 0 -1 1 gives nothing and won't loop
+for rotnum in $(seq $ROTATION -1 1);do
+    let oldrotnum=$rotnum-1
+    [ -f $DAILY/${SERVER}.${oldrotnum}.$TAREXT ] && /bin/mv -f $DAILY/${SERVER}.${oldrotnum}.$TAREXT $DAILY/${SERVER}.${rotnum}.$TAREXT
+done
+
+[ -f ${IPC}/${SERVER}.tar.errors -a ! -s ${IPC}/${SERVER}.tar.errors ] && /bin/rm -f ${IPC}/${SERVER}.tar.errors
+logentry 3 "tar of $SERVER: started: $(date -r $IPC/$SERVER.tar.run '+%b %e %T')  finished: $(date '+%b %e %T')"
+
+################## check EOM status and copy to eom if needed here
+logentry 1 "Checking if EOM is needed for $SERVER"
+eomneeded="n"
+case $MONTHLY in
+n)
+    logentry 1 "$SERVER is not configured for EOM backups"
+    ;;
+y)
+    # do any eom files for this server exist?
+    if [ "$(ls ${EOM}/${SERVER}/${SERVER}* 2>/dev/null|wc -l)" -gt 0 ];then
+        # when was the last eomfile created
+        if [ "$(date +%Y%m)" != "$(date -r $(ls -tr ${EOM}/${SERVER}/${SERVER}*|tail -1) +%Y%m)" ];then
+            logentry 1 "last EOM for $SERVER is not this month"
+            eomneeded="y"
+        else
+            logentry 1 "$SERVER already has an EOM for this month"
+        fi
+    else
+        logentry 1 "$SERVER has never had an EOM backup"
+        # they do not have any eom files, so we need 1
+        eomneeded="y"
+    fi
+    ;;
+f)
+    if [ "$TYPEARGfile" == "$MONTHFILEfile" ];then
+        # eod file the same as eom file... really? c'mon
+        logentry 5 "EOM flag file == EOM flag file ($MONTHFILEfile)"
+    else
+        # for type f, differences between file and last file indicates an EOM is needed
+        [ -d $LASTFLAGS/$SERVER ] || mkdir $LASTFLAGS/$SERVER
+        [ -f $LASTFLAGS/$SERVER/$MONTHFILEfile ] || touch $LASTFLAGS/$SERVER/$MONTHFILEfile
+        [ -d $FLAGS/$SERVER ] || mkdir $FLAGS/$SERVER
+        logentry 1 "rsyncing eom flag file: $SERVER$RSYNCsep$MONTHFILEfile"
+        # yeah, I know I'm using the tar file to record rsync errors, but this is the tar script
+        rsync -aqz --delete --timeout=300 $SERVER$RSYNCsep$MONTHFILE $FLAGS/$SERVER 2>${IPC}/${SERVER}.tar.errors
+        if [ $? -ne 0 ];then
+            logentry 5 "Error while rsyncing eom flag file: $SERVER$RSYNCsep$MONTHFILE was:"
+            logentryfile 5 ${IPC}/${SERVER}.tar.errors
+            /bin/rm -f ${IPC}/${SERVER}.tar.errors
+            getoutofhere
+        fi
+        [ -f ${IPC}/${SERVER}.tar.errors -a ! -s ${IPC}/${SERVER}.tar.errors ] && /bin/rm -f ${IPC}/${SERVER}.tar.errors
+        # has flag file changed?
+        if ! diff -q $FLAGS/$SERVER/$MONTHFILEfile $LASTFLAGS/$SERVER/$MONTHFILEfile >/dev/null;then
+            logentry 1 "differences found in last/current $MONTHFILEfile"
+            eomneeded="y"
+        else
+            logentry 1 "no differences found in last/current $MONTHFILEfile"
+        fi
+    fi
+    EOMfilenamepart="$(date -r $FLAGS/$SERVER/$MONTHFILEfile +%Y-%m-%d)"
+    ;;
+*)
+    logentry 5 "Invalid MONTHLY value for $SERVER"
+    uglyexit
+    ;;
+esac
+
+if [ "$eomneeded" == "y" ];then
+    logentry 2 "Creating EOM backup for $SERVER"
+    EOMstart="$(date)"
+    [ "$EOMfilenamepart" == "" ] && EOMfilenamepart="$(date +%Y-%m-%d)"
+    EOMfilename="${SERVER}-EOM-${EOMfilenamepart}.${TAREXT}"
+    [ -d ${EOM}/${SERVER} ] || mkdir -p ${EOM}/${SERVER}
+    /bin/cp -p $DAILY/${SERVER}.1.$TAREXT ${EOM}/${SERVER}/$EOMfilename 2>${IPC}/${SERVER}.tar.errors
+    if [ $? -ne 0 ];then
+        logentry 5 "Error while creating EOM file for $SERVER"
+        logentryfile 5 ${IPC}/${SERVER}.tar.errors
+        /bin/rm -f ${IPC}/${SERVER}.tar.errors
+        uglyexit
+    fi
+    logentry 3 "EOM for $SERVER started: $EOMstart  finished: $(date)"
+fi
+
+# success... update the flag file
+[ "$MONTHLY" == "f" ] && /bin/cp -pf $FLAGS/$SERVER/$MONTHFILEfile $LASTFLAGS/$SERVER/
+
+### put monthly rotation/retention here
+
+logentry 2 "removing all status files for $SERVER"
+# backup complete for this server, remove all status files
+/bin/rm -f ${IPC}/${SERVER}.*
+logentry 1 "Exiting $(basename $0): tar of $SERVER complete"

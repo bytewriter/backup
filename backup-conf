@@ -1,0 +1,99 @@
+# The variables that tell us where everything goes
+# This file: /backup/bin/backup-conf
+# mel - Feb 2011
+
+ERROREMAIL="linux@example.com"
+
+# BACKUPBASE is the base directory. Almost everything else will be under this
+BACKUPBASE=/backup
+
+# What language do we speak
+BULANG="en"
+# where are language files kept
+LANGDIR=$BACKUPBASE/languages
+
+# CONF is where backup.conf is kept. It holds all configurable options and the
+# list of servers to back up, and options for each server.
+CONF=$BACKUPBASE/conf
+
+# if security is on for a particular server, this is the username it will
+# try to use:
+BACKUPUSER=backup
+# IPC is the inter process communication directory. This should be the same
+# location on the SAN for all servers doing backups, so each process can tell
+# who is backing up whom.
+IPC=$BACKUPBASE/ipc
+
+# DAILY where are the daily rotation compressed backups are kept.
+DAILY=$BACKUPBASE/daily
+
+# EOM where all the end of month compressed backups are kept.
+EOM=$BACKUPBASE/eom
+
+# LATEST - working directory where files from each backup target will be
+# stored so that the compressed tar can be created from it
+LATEST=$BACKUPBASE/latest
+
+# LOGS
+LOGS=$BACKUPBASE/log
+LOGFILE=$LOGS/backup
+
+# LOGLEVEL
+# 1=Trace (All)
+Trace=1
+# 2=Debug
+Debug=2
+# 3=Info
+Info=3
+# 4=Warning
+Warning=4
+# 5=Error
+Error=5
+# 6=Fatal
+Fatal=6
+# 7=None
+LOGLEVEL=$Debug
+
+# FLAGS where flag files for BKUPTYPE=f are placed.
+FLAGS=$BACKUPBASE/flags
+
+# LASTFLAGS flag files from last time used to check for differences.
+LASTFLAGS=$BACKUPBASE/lastflags
+
+# MAXRSYNCS is the max number of rsyncs to run at one time per server. These
+# can eat a lot of network resources. Configure accordingly.
+MAXRSYNCS=28
+
+# TAREXT - the extension of the filename that will be used ie: in filename.bz2, "bz2" is the extension
+#TAREXT="tgz"
+TAREXT="bz2"
+
+# TARARGS - arguments to tar used during compression
+#TARARGS="czf"
+#TARARGS="cjf"
+TARARGS="c --use-compress-prog=pbzip2 -f"
+
+# MAXTARS is the max number of tar processes to run at one time per server.
+# These eat a lot of CPU and SAN resources. Configure accordingly.
+MAXTARS=8
+
+# max wait time in seconds for a run file to appear when spawning a child process
+MAXWAIT=15
+
+# WEB files go here - there should be an html directory in the directory below
+WEB=$BACKUPBASE/web
+
+# how old a backup can be in minutes before a warning status, 4320=3 days -- in case of long weekends
+BACKUPAGEWARNMINUTES=4320
+# how old a backup can be in minutes before a critical status, 5760=4 days
+BACKUPAGECRITMINUTES=5760
+
+# how many minutes rsync can run before it show a warning on web page
+RSYNCWARNMINUTES=120
+# how many minutes rsync can run before it show critical on web page
+RSYNCCRITMINUTES=240
+
+# how many minutes tar can run before it show a warning on web page
+TARWARNMINUTES=120
+# how many minutes tar can run before it shows critical on web page
+TARCRITMINUTES=240

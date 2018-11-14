@@ -1,0 +1,139 @@
+#!/bin/bash
+# This file: /backup/bin/backup-functions
+# common functions for all the backup scripts
+# mel - 2014-04-18 - lock mechanism for log file
+# mel - 2014-05-19 - switch lock mechanism, ln is faster
+# mel - 2015-10-15 - 1st sync schedules sync and returns; 2nd sync blocks until 1st finishes
+
+# stop multibyte from screwing up our world
+export LANG=C LC_ALL=C
+
+# get our language variables
+if [ -f $LANGDIR/backup.$BULANG ];then
+    . $LANGDIR/backup.$BULANG
+else
+    echo "Missing $LANGDIR/backup.$BULANG"
+    exit
+fi
+
+
+# get timestamp of a file and compare it to current time
+gethowlong(){
+    howlongdate="$(date -r $1)"
+    howlongstartedseconds="$(date +%s -r $1)"
+    let howlongseconds=$(date +%s)-howlongstartedseconds
+    let howlongtotalminutes=howlongseconds/60
+    let howlongdays=howlongseconds/86400
+    let secondsleft=howlongseconds%86400
+    let howlonghours=secondsleft/3600
+    let secondsleft=secondsleft%3600
+    let howlongminutes=secondsleft/60
+    let secondsleft=secondsleft%60;
+    if [ $howlongdays -gt 0 ];then
+        howlongshort="$howlongdays $LANGDAYS, $howlonghours $LANGHOURS, $howlongminutes $LANGMINS, $secondsleft $LANGSECS"
+    elif [ $howlonghours -gt 0 ];then
+        howlongshort="$howlonghours $LANGHOURS, $howlongminutes $LANGMINS, $secondsleft $LANGSECS"
+    else
+        howlongshort="$howlongminutes $LANGMINS, $secondsleft $LANGSECS"
+    fi
+}
+
+configerror(){
+    echo "$LANGERRORINCONFIG $1 $LANGNOTDEFINED"
+    exit
+}
+
+configinvalid(){
+    echo "$LANGERRORINCONFIG $1 $LANGISINVALID"
+}
+
+# Validate a backup line options, set argserrors=1 if invalid
+getserverargs(){
+    serverline="$(grep -m1 ^$1, ${CONF}/backup.conf)"
+    argserrors=0
+    BKUPTYPE="$(echo $serverline|awk -F, '{print $2}')"
+    case "$BKUPTYPE" in f|s|d) ;;
+        *) configinvalid BKUPTYPE;argserrors=1;;
+    esac
+    TYPEARG="$(echo $serverline|awk -F, '{print $3}')"
+    if [ $BKUPTYPE == "f" ];then
+        [ $TYPEARG == "" ] || TYPEARGfile="$(basename ${TYPEARG##*/})"
+    fi
+    SECFLAG="$(echo $serverline|awk -F, '{print $4}')"
+    case "$SECFLAG" in 
+        y) RSYNCsep=":";;
+        n) RSYNCsep="::";;
+        *) configinvalid SECFLAG;argserrors=1;;
+    esac
+    DELFLAG="$(echo $serverline|awk -F, '{print $5}')"
+    case "$DELFLAG" in
+        y) DELarg="--delete";;
+        n) DELarg="";;
+        *) configinvalid DELFLAG;argserrors=1;;
+    esac
+    ROTATION="$(echo $serverline|awk -F, '{print $6}')"
+    VALIDATION="$(echo $serverline|awk -F, '{print $7}')"
+    SKIPVALID="$(echo $serverline|awk -F, '{print $8}')"
+    SKIPUSERS="$(echo $serverline|awk -F, '{print $9}')"
+    VFAILMAIL="$(echo $serverline|awk -F, '{print $10}')"
+    MONTHLY="$(echo $serverline|awk -F, '{print $11}')"
+    case "$MONTHLY" in y|f) ;;
+        *) MONTHLY="n";;
+    esac
+    MONTHFILE="$(echo $serverline|awk -F, '{print $12}')"
+    if [ "$MONTHLY" == "f" ];then
+        MONTHFILEfile="${MONTHFILE##*/}"
+    fi
+    MONTHRET="$(echo $serverline|awk -F, '{print $13}')"
+    [ "$MONTHRET" == "" ] && MONTHRET="0"
+}
+
+getlogtype(){
+    case $1 in
+        1) LOGTYPE="Trace";;
+        2) LOGTYPE="Debug";;
+        3) LOGTYPE="Info";;
+        4) LOGTYPE="Warning";;
+        5) LOGTYPE="Error";;
+        6) LOGTYPE="Fatal";;
+        *) LOGTYPE="Unknown";;
+    esac
+}
+
+logentry(){
+    getlogtype $1
+    [ "x$LOGLEVEL" == "x" ] && LOGLEVEL=3
+    if [ $1 -ge "$LOGLEVEL" ];then
+        [ -d $(dirname $LOGFILE) ] || mkdir -p $(dirname $LOGFILE)
+        # wait for a lock on the log file - this allows for a mounted and shared file, which flock does not -mel
+        let lock=1
+        while [ $lock -ne 0 ];do
+            [ -L $LOGFILE.lock ] && continue
+            # dev null because sometimes it appears in the fraction of second, and we loop back on error anyway
+            ln -s $LOGFILE $LOGFILE.lock 2>/dev/null
+            lock=$?
+            sync;sync
+        done
+        echo "$(date '+%b %e %T') $(hostname) $(basename $0)[$$] [$LOGTYPE] $2" >>$LOGFILE
+        [ -L $LOGFILE.lock ] && rm -f $LOGFILE.lock
+        sync;sync
+    fi
+}
+
+logentryfile(){
+    getlogtype $1
+    [ "x$LOGLEVEL" == "x" ] && LOGLEVEL=3
+    # wait for a lock on the log file - this allows for a mounted and shared file, which flock does not -mel
+    let lock=1
+    while [ $lock -ne 0 ];do
+        [ -L $LOGFILE.lock ] && continue
+        # dev null because sometimes it appears in the fraction of second, and we loop back on error anyway
+        ln -s $LOGFILE $LOGFILE.lock 2>/dev/null
+        lock=$?
+        sync;sync
+    done
+    awk -vhdr="$(date '+%b %e %T') $(hostname) $(basename $0)[$$] [$LOGTYPE]" '{printf("%s %s\n",hdr,$0)}' $2 >>$LOGFILE
+    [ -L $LOGFILE.lock ] && rm -f $LOGFILE.lock
+    sync;sync
+    /bin/rm -f $2
+}

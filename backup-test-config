@@ -1,0 +1,41 @@
+#!/bin/bash
+# This file: /backup/bin/backup-test-config
+# script to test config file for validity (not done yet FIXME )
+# Mel - 2011-04-26
+
+# stop multibyte from screwing up our world
+export LANG=C LC_ALL=C
+
+# figure out where we are to find configs and bins
+pushd $(dirname $0) >/dev/null
+if [ -f backup-conf ];then
+    . backup-conf
+else
+    echo "No backup-conf in $(pwd)"
+    exit
+fi
+if [ -f backup-functions ];then
+    . backup-functions
+else
+    echo "Missing $(pwd)/backup-functions"
+    exit
+fi
+popd >/dev/null
+for SERVER in $(egrep '^[a-z0-9]' ${CONF}/backup.conf|sed 's/,.*$//');do
+    getserverargs $SERVER
+    cat << MEL
+SERVER: $SERVER
+    BKUPTYPE:   $BKUPTYPE
+    TYPEARG:    $TYPEARG
+    SECFLAG:    $SECFLAG
+    DELFLAG:    $DELFLAG
+    ROTATION:   $ROTATION
+    VALIDATION: $VALIDATION
+    SKIPVALID:  $SKIPVALID
+    SKIPUSERS:  $SKIPUSERS
+    VFAILMAIL:  $VFAILMAIL
+    MONTHLY:    $MONTHLY
+    MONTHFILE:  $MONTHFILE
+    MONTHRET:   $MONTHRET
+MEL
+done
